@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Autoplay on Visible
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Проигрывает видео только когда оно реально видно на экране, пауза при скрытии, звук только у самого видимого. Работает на любом сайте.
 // @author       You
 // @match        *://*/*
@@ -78,31 +78,66 @@
         s.visible = visible;
 
         if (visible) {
-            play(video);
-            maybeUnmute(video);
+            // Пока видео на экране — не спорим с пользователем: если он сам
+            // поставил на паузу или заглушил звук через интерфейс сайта,
+            // оставляем как есть. Автоматика снова берёт управление только
+            // после того, как ролик уйдёт с экрана и вернётся заново.
+            if (!s.userPaused) play(video);
+            if (!s.userMuted) maybeUnmute(video);
         } else {
             pause(video);
+            s.userPaused = false;
+            s.userMuted = false;
             if (currentlyUnmuted === video) {
                 currentlyUnmuted = null;
+                markInternal(video);
                 video.muted = true;
             }
         }
     }
 
+    // Вызовы play()/pause() самого скрипта помечаем как "внутренние",
+    // чтобы отличить их от событий play/pause/volumechange, вызванных
+    // пользователем (клик по видео, кнопка звука в плеере сайта и т.п.) —
+    // см. onNativePause/onNativeVolumeChange.
+    function markInternal(video) {
+        const s = state.get(video);
+        s.internal = true;
+        setTimeout(() => { s.internal = false; }, 0);
+    }
+
+    function onNativePause(video) {
+        const s = state.get(video);
+        if (!s || s.internal) return;
+        s.userPaused = true;
+    }
+
+    function onNativeVolumeChange(video) {
+        const s = state.get(video);
+        if (!s || s.internal) return;
+        s.userMuted = video.muted;
+    }
+
     function play(video) {
         if (!video.paused) return;
+        markInternal(video);
         const p = video.play();
         if (p && p.catch) {
             p.catch((err) => {
                 log('play() отклонён, пробую снова с muted:', err);
+                markInternal(video);
                 video.muted = true;
+                markInternal(video);
                 video.play().catch((e) => log('не удалось воспроизвести даже с muted:', e));
             });
         }
     }
 
     function pause(video) {
-        if (!video.paused) video.pause();
+        if (!video.paused) {
+            markInternal(video);
+            video.pause();
+        }
     }
 
     // Снятие muted с уже играющего видео не требует пользовательского
@@ -116,11 +151,13 @@
             const best = pickMostVisible();
             if (best !== video) return;
             if (currentlyUnmuted && currentlyUnmuted !== video) {
+                markInternal(currentlyUnmuted);
                 currentlyUnmuted.muted = true;
             }
             currentlyUnmuted = video;
         }
 
+        markInternal(video);
         video.muted = false;
         video.volume = Math.min(video.volume || CONFIG.maxVolume, CONFIG.maxVolume);
     }
@@ -143,7 +180,19 @@
     function watch(video) {
         if (known.has(video)) return;
         known.add(video);
-        state.set(video, { visible: false, timer: null });
+        const onPause = () => onNativePause(video);
+        const onVolumeChange = () => onNativeVolumeChange(video);
+        state.set(video, {
+            visible: false,
+            timer: null,
+            internal: false,
+            userPaused: false,
+            userMuted: false,
+            onPause,
+            onVolumeChange,
+        });
+        video.addEventListener('pause', onPause);
+        video.addEventListener('volumechange', onVolumeChange);
         io.observe(video);
         scheduleRecheck(video);
         log('наблюдаю за новым видео', video);
@@ -151,8 +200,13 @@
 
     function unwatch(video) {
         if (!known.has(video)) return;
+        const s = state.get(video);
         io.unobserve(video);
-        clearTimeout(state.get(video)?.timer);
+        clearTimeout(s?.timer);
+        if (s) {
+            video.removeEventListener('pause', s.onPause);
+            video.removeEventListener('volumechange', s.onVolumeChange);
+        }
         state.delete(video);
         known.delete(video);
         if (currentlyUnmuted === video) currentlyUnmuted = null;
