@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Autoplay on Visible
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Проигрывает видео только когда оно реально видно на экране, пауза при скрытии, звук только у самого видимого. Работает на любом сайте.
 // @author       You
 // @match        *://*/*
@@ -90,44 +90,57 @@
             s.userMuted = false;
             if (currentlyUnmuted === video) {
                 currentlyUnmuted = null;
-                markInternal(video);
+                expect(video, 'volumechange');
                 video.muted = true;
             }
         }
     }
 
-    // Вызовы play()/pause() самого скрипта помечаем как "внутренние",
-    // чтобы отличить их от событий play/pause/volumechange, вызванных
-    // пользователем (клик по видео, кнопка звука в плеере сайта и т.п.) —
-    // см. onNativePause/onNativeVolumeChange.
-    function markInternal(video) {
+    // Отличаем свои собственные play()/pause()/muted-мутации от событий,
+    // вызванных пользователем (клик по видео, кнопка звука в плеере сайта).
+    // Раньше это делалось через "пометил + setTimeout(0) снял пометку",
+    // но 'pause' и 'volumechange' по спецификации ставятся в отдельную
+    // очередь задач браузера (media element event task source) и не
+    // гарантированно успевают дойти раньше, чем setTimeout(0) снимет
+    // пометку — из-за этого свои же действия иногда ошибочно считались
+    // "ручными" и намертво блокировали автоплей/звук для видео. Теперь
+    // просто считаем, сколько событий каждого типа мы сами вызвали, и
+    // игнорируем ровно столько, сколько прилетит — независимо от таймингов.
+    function expect(video, prop) {
         const s = state.get(video);
-        s.internal = true;
-        setTimeout(() => { s.internal = false; }, 0);
+        if (!s) return;
+        s.pending[prop] = (s.pending[prop] || 0) + 1;
+    }
+
+    function consumeExpected(video, prop) {
+        const s = state.get(video);
+        if (!s || !s.pending[prop]) return false;
+        s.pending[prop]--;
+        return true;
     }
 
     function onNativePause(video) {
+        if (consumeExpected(video, 'pause')) return;
         const s = state.get(video);
-        if (!s || s.internal) return;
+        if (!s) return;
         s.userPaused = true;
     }
 
     function onNativeVolumeChange(video) {
+        if (consumeExpected(video, 'volumechange')) return;
         const s = state.get(video);
-        if (!s || s.internal) return;
+        if (!s) return;
         s.userMuted = video.muted;
     }
 
     function play(video) {
         if (!video.paused) return;
-        markInternal(video);
         const p = video.play();
         if (p && p.catch) {
             p.catch((err) => {
                 log('play() отклонён, пробую снова с muted:', err);
-                markInternal(video);
+                expect(video, 'volumechange');
                 video.muted = true;
-                markInternal(video);
                 video.play().catch((e) => log('не удалось воспроизвести даже с muted:', e));
             });
         }
@@ -135,7 +148,7 @@
 
     function pause(video) {
         if (!video.paused) {
-            markInternal(video);
+            expect(video, 'pause');
             video.pause();
         }
     }
@@ -151,14 +164,15 @@
             const best = pickMostVisible();
             if (best !== video) return;
             if (currentlyUnmuted && currentlyUnmuted !== video) {
-                markInternal(currentlyUnmuted);
+                expect(currentlyUnmuted, 'volumechange');
                 currentlyUnmuted.muted = true;
             }
             currentlyUnmuted = video;
         }
 
-        markInternal(video);
+        expect(video, 'volumechange'); // за muted = false
         video.muted = false;
+        expect(video, 'volumechange'); // за volume = ...
         video.volume = Math.min(video.volume || CONFIG.maxVolume, CONFIG.maxVolume);
     }
 
@@ -185,7 +199,7 @@
         state.set(video, {
             visible: false,
             timer: null,
-            internal: false,
+            pending: {},
             userPaused: false,
             userMuted: false,
             onPause,
