@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Video Autoplay on Visible
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Проигрывает видео только когда оно реально видно на экране, пауза при скрытии, звук только у самого видимого. Работает на любом сайте.
 // @author       You
 // @match        *://*/*
@@ -82,16 +82,14 @@
             // поставил на паузу или заглушил звук через интерфейс сайта,
             // оставляем как есть. Автоматика снова берёт управление только
             // после того, как ролик уйдёт с экрана и вернётся заново.
-            if (!s.userPaused) play(video);
-            if (!s.userMuted) maybeUnmute(video);
+            if (!s.userPaused) activate(video, s);
         } else {
             pause(video);
             s.userPaused = false;
             s.userMuted = false;
             if (currentlyUnmuted === video) {
                 currentlyUnmuted = null;
-                expect(video, 'volumechange');
-                video.muted = true;
+                setMuted(video, true);
             }
         }
     }
@@ -133,16 +131,52 @@
         s.userMuted = video.muted;
     }
 
-    function play(video) {
-        if (!video.paused) return;
-        const p = video.play();
-        if (p && p.catch) {
-            p.catch((err) => {
-                log('play() отклонён, пробую снова с muted:', err);
-                expect(video, 'volumechange');
-                video.muted = true;
-                video.play().catch((e) => log('не удалось воспроизвести даже с muted:', e));
-            });
+    // play() и включение звука раньше вызывались как две независимые
+    // операции: play() стартует асинхронно и, если браузер отклоняет
+    // первую попытку "со звуком" (нет пользовательского жеста — Chrome
+    // блокирует запуск воспроизведения со звуком без него), откатывается
+    // на muted=true уже ПОСЛЕ того, как параллельный вызов unmute успел
+    // выставить muted=false — тогда откат перетирал успешный unmute в
+    // непредсказуемом порядке ("иногда" не работает звук на первом видео
+    // за сессию). Теперь решение "нужен ли звук этому видео" принимается
+    // один раз и передаётся в play(), а откат на muted происходит только
+    // внутри её же .catch(), без гонки с отдельной функцией unmute.
+    function activate(video, s) {
+        const wantSound = !s.userMuted && CONFIG.unmuteActive
+            && (!CONFIG.onlyOneUnmuted || pickMostVisible() === video);
+
+        if (wantSound) claimUnmute(video);
+
+        if (video.paused) {
+            if (wantSound) setMuted(video, false);
+            const p = video.play();
+            if (p && p.catch) {
+                p.catch((err) => {
+                    log('play() отклонён, пробую снова с muted:', err);
+                    setMuted(video, true);
+                    video.play().catch((e) => log('не удалось воспроизвести даже с muted:', e));
+                });
+            }
+        } else if (wantSound) {
+            // Уже играет — снять mute с уже играющего видео браузер не блокирует.
+            setMuted(video, false);
+        }
+    }
+
+    function claimUnmute(video) {
+        if (!CONFIG.onlyOneUnmuted) return;
+        if (currentlyUnmuted && currentlyUnmuted !== video) {
+            setMuted(currentlyUnmuted, true);
+        }
+        currentlyUnmuted = video;
+    }
+
+    function setMuted(video, muted) {
+        expect(video, 'volumechange');
+        video.muted = muted;
+        if (!muted) {
+            expect(video, 'volumechange');
+            video.volume = Math.min(video.volume || CONFIG.maxVolume, CONFIG.maxVolume);
         }
     }
 
@@ -151,29 +185,6 @@
             expect(video, 'pause');
             video.pause();
         }
-    }
-
-    // Снятие muted с уже играющего видео не требует пользовательского
-    // жеста (жест нужен только чтобы ЗАПУСТИТЬ воспроизведение со звуком) —
-    // если у видео стоит нативный autoplay+muted, оно уже играет тихо
-    // к моменту, когда мы решаем включить звук.
-    function maybeUnmute(video) {
-        if (!CONFIG.unmuteActive) return;
-
-        if (CONFIG.onlyOneUnmuted) {
-            const best = pickMostVisible();
-            if (best !== video) return;
-            if (currentlyUnmuted && currentlyUnmuted !== video) {
-                expect(currentlyUnmuted, 'volumechange');
-                currentlyUnmuted.muted = true;
-            }
-            currentlyUnmuted = video;
-        }
-
-        expect(video, 'volumechange'); // за muted = false
-        video.muted = false;
-        expect(video, 'volumechange'); // за volume = ...
-        video.volume = Math.min(video.volume || CONFIG.maxVolume, CONFIG.maxVolume);
     }
 
     function pickMostVisible() {
@@ -283,7 +294,7 @@
     else window.addEventListener('load', init);
 
     window.VideoAutoplay = {
-        playAll: () => document.querySelectorAll('video').forEach(play),
+        playAll: () => document.querySelectorAll('video').forEach((v) => { const s = state.get(v); if (s) activate(v, s); }),
         pauseAll: () => document.querySelectorAll('video').forEach(pause),
         config: CONFIG,
     };
